@@ -20,12 +20,15 @@ package raft
 import (
 	//	"bytes"
 
+	"bytes"
+	"fmt"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	//	"6.824/labgob"
+	"6.824/labgob"
 	"6.824/labrpc"
 )
 
@@ -122,6 +125,14 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -144,6 +155,18 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+	var log []LogEntry
+	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&log) != nil {
+		fmt.Println("decode error......")
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.log = log
+	}
 }
 
 //
@@ -204,6 +227,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		// 如果对方的term更优，将peer的term更新到对方的term，同时转换状态为follower，重置其投票状态为-1
 		rf.currentTerm = args.Term
 		rf.setFollower()
+		rf.persist()
 	}
 
 	if rf.currentTerm > args.Term {
@@ -219,6 +243,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			((args.LastLogTerm == rf.log[len(rf.log)-1].Term) && (args.LastLogIndex >= len(rf.log)-1)) {
 			// 对方的log任期更新，或对方的log任期相同且log index大于等于peer
 			rf.votedFor = args.CandidateId
+			rf.persist()
 			reply.VoteGranted = true
 			rf.flushElectionTimer()
 		}
@@ -260,8 +285,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			// 如果对方的term更优，将peer的term更新到对方的term，同时转换状态为follower
 			rf.currentTerm = args.Term
 			rf.setFollower()
+			rf.persist()
 		}
 	}
+
+	// fmt.Printf("%d from %d: my last apply %d, my log length %d, received entries length %d; my commit %d, leader commit %d; my term %d, leader term %d, pidx %d, pt %d\n",
+	// 	rf.me, args.LeaderId, rf.lastApplied, len(rf.log), len(args.Entries), rf.commitIndex, args.LeaderCommit, rf.currentTerm, args.Term, args.PrevLogIndex, args.PrevLogTerm)
 
 	// 下面都是append entries的判断
 	if args.Term < rf.currentTerm {
@@ -297,6 +326,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if log_idx >= len(rf.log) {
 			// 该idx位置开始的entries为新增entries，追加到peer的log后
 			rf.log = append(rf.log, args.Entries[idx:]...)
+			rf.persist()
 			break
 		}
 
@@ -306,6 +336,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.log = rf.log[:log_idx]
 			// 再将后续entries追加
 			rf.log = append(rf.log, args.Entries[idx:]...)
+			rf.persist()
 			break
 		}
 	}
@@ -319,8 +350,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.commitIndex = args.PrevLogIndex + len(args.Entries)
 		}
 	}
-	// fmt.Printf("%d from %d: my log length %d, received entries length %d; my commit %d, leader commit %d; my term %d, leader term %d, pidx %d, pt %d\n",
-	// 	rf.me, args.LeaderId, len(rf.log), len(args.Entries), rf.commitIndex, args.LeaderCommit, rf.currentTerm, args.Term, args.PrevLogIndex, args.PrevLogTerm)
 }
 
 func prependEntry(x []LogEntry, y LogEntry) []LogEntry {
@@ -363,6 +392,7 @@ func (rf *Raft) replicateLogSingle(server int) {
 					// 如果leader的当前任期过期，更新rf的任期，转换为follower
 					rf.currentTerm = reply.Term
 					rf.setFollower()
+					rf.persist()
 				}
 
 				rf.mu.Unlock()
@@ -384,13 +414,24 @@ func (rf *Raft) replicateLogSingle(server int) {
 				break
 			} else {
 				// 同步log失败，将PrevLogIndex前移一位重试
+				// 优化，将PrevLogIndex前移至前一term
 				rf.mu.Lock()
-				insertLog := LogEntry{}
-				insertLog.Command = rf.log[args.PrevLogIndex].Command
-				insertLog.Term = rf.log[args.PrevLogIndex].Term
-				args.Entries = prependEntry(args.Entries, insertLog)
-				args.PrevLogIndex--
+				// insertLog := LogEntry{}
+				// insertLog.Command = rf.log[args.PrevLogIndex].Command
+				// insertLog.Term = rf.log[args.PrevLogIndex].Term
+				// args.Entries = prependEntry(args.Entries, insertLog)
+				// args.PrevLogIndex--
+				// args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
+
+				pIdx := args.PrevLogIndex
+				for args.PrevLogTerm == rf.log[args.PrevLogIndex].Term {
+					// PrevLogIndex不断递减直到前一term
+					args.PrevLogIndex--
+				}
 				args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
+				insertEntries := make([]LogEntry, pIdx-args.PrevLogIndex)
+				copy(insertEntries, rf.log[args.PrevLogIndex+1:pIdx+1])
+				args.Entries = append(insertEntries, args.Entries...)
 				rf.mu.Unlock()
 			}
 		}
@@ -407,6 +448,7 @@ func (rf *Raft) replicateLog(cmd interface{}) int {
 	rf.mu.Lock()
 	// local log添加cmd
 	rf.log = append(rf.log, LogEntry{cmd, rf.currentTerm})
+	rf.persist()
 	// 日志最终commit时的索引
 	toCommitIdx := len(rf.log) - 1
 	rf.mu.Unlock()
@@ -541,6 +583,7 @@ func (rf *Raft) heartBeatsSingle(server int) {
 			rf.mu.Lock()
 			rf.currentTerm = reply.Term
 			rf.setFollower()
+			rf.persist()
 			rf.mu.Unlock()
 		}
 	}
@@ -580,6 +623,7 @@ func (rf *Raft) getVoteSingle(server int, ch chan<- bool) {
 			if rf.currentTerm < reply.Term {
 				rf.currentTerm = reply.Term
 				rf.setFollower()
+				rf.persist()
 			}
 			rf.mu.Unlock()
 			ch <- reply.VoteGranted
@@ -701,7 +745,8 @@ func (rf *Raft) ticker() {
 			rf.state = 1                        // 状态转化为candidate
 			rf.currentTerm = rf.currentTerm + 1 // 任期加一
 			rf.votedFor = rf.me                 // 投自己
-			rf.flushElectionTimer()             // 刷新选举timer
+			rf.persist()
+			rf.flushElectionTimer() // 刷新选举timer
 			rf.mu.Unlock()
 
 			// 向其他server发送投票请求
@@ -785,7 +830,7 @@ func (rf *Raft) ticker() {
 func (rf *Raft) checkApply() {
 	for {
 		rf.mu.Lock()
-		if rf.commitIndex > rf.lastApplied {
+		for rf.commitIndex > rf.lastApplied {
 			rf.lastApplied++
 			rf.applyCh <- ApplyMsg{CommandValid: true, Command: rf.log[rf.lastApplied].Command, CommandIndex: rf.lastApplied}
 		}

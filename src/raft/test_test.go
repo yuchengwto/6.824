@@ -202,7 +202,6 @@ func TestFailAgree2B(t *testing.T) {
 
 	// re-connect
 	cfg.connect((leader + 1) % servers)
-
 	// the full set of servers should preserve
 	// previous agreements, and be able to agree
 	// on new commands.
