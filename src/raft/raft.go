@@ -698,8 +698,13 @@ func (rf *Raft) onLogReplySucceed(matchIndex int, server int) {
 }
 
 func (rf *Raft) onLogReplyFail(prevLogIndex int, prevLogTerm int, server int) {
-
+	DPrintf("%d append log fail, peer lastIncludedIdx %d, adjust nextIndex[%d], pIdx %d, pt %d, previous nextIdx %d\n", rf.me, rf.lastIncludedIndex, server, prevLogIndex, prevLogTerm, rf.nextIndex[server])
 	for {
+		if rf.absIdxToLogIdx((prevLogIndex)) < 0 {
+			// 越界
+			break
+		}
+
 		if prevLogTerm != rf.log[rf.absIdxToLogIdx(prevLogIndex)].Term {
 			// 到达前一term
 			break
