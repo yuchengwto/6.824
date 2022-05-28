@@ -1,15 +1,17 @@
 package kvraft
 
 import (
-	"6.824/labgob"
-	"6.824/labrpc"
-	"6.824/raft"
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
+
+	"6.824/labgob"
+	"6.824/labrpc"
+	"6.824/raft"
 )
 
-const Debug = false
+const Debug = true
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -18,11 +20,20 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Key       string
+	Value     string
+	Op        string
+	ClientId  int
+	CommandId int
+}
+
+type ReplyMsg struct {
+	Err   Err
+	Value string
 }
 
 type KVServer struct {
@@ -35,15 +46,189 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	database   map[string]string
+	lastOpMap  map[int]int           // 对应client已被大多数服务器处理的日志id
+	replyChMap map[int]chan ReplyMsg // 每条日志id对应的响应channel
 }
 
+func (kv *KVServer) GetValGR(key string, reply *GetReply) {
+	if val, ok := kv.database[key]; ok {
+		// key存在
+		reply.Err = OK
+		reply.Value = val
+	} else {
+		// key不存在
+		reply.Err = ErrNoKey
+		reply.Value = ""
+	}
+}
+
+func (kv *KVServer) GetValRM(key string, reply *ReplyMsg) {
+	if val, ok := kv.database[key]; ok {
+		// key存在
+		reply.Err = OK
+		reply.Value = val
+	} else {
+		// key不存在
+		reply.Err = ErrNoKey
+		reply.Value = ""
+	}
+}
+
+func (kv *KVServer) freeReplyMap(index int) {
+	kv.mu.Lock()
+	delete(kv.replyChMap, index)
+	kv.mu.Unlock()
+}
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	kv.mu.Lock()
+	// 判断该op是否已经commit到raft log
+	if lastOpIdx, ok := kv.lastOpMap[args.ClientId]; ok {
+		if lastOpIdx >= args.CommandId {
+			// op索引已过期，直接取值返回
+			kv.GetValGR(args.Key, reply)
+			kv.mu.Unlock()
+			DPrintf("%d get return early, lastOpIdx %d, command id %d", kv.me, lastOpIdx, args.CommandId)
+			return
+		}
+	}
+
+	// 向raft log发送op request
+	op := Op{
+		Key:       args.Key,
+		Value:     "",
+		Op:        "Get",
+		ClientId:  args.ClientId,
+		CommandId: args.CommandId,
+	}
+	toCommitIdx, _, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		reply.Value = ""
+		kv.mu.Unlock()
+		return
+	}
+
+	// 创建toCommitIdx对应的响应channel
+	replyCh := make(chan ReplyMsg)
+	kv.replyChMap[toCommitIdx] = replyCh
+	kv.mu.Unlock()
+
+	// 等待execOp后的响应
+	select {
+	case replyMsg := <-replyCh:
+		reply.Err = replyMsg.Err
+		reply.Value = replyMsg.Value
+	case <-time.After(500 * time.Millisecond):
+		reply.Err = ErrTimeOut
+	}
+
+	go kv.freeReplyMap(toCommitIdx)
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	kv.mu.Lock()
+	// 判断该op是否已经commit到raft log
+	if lastOpIdx, ok := kv.lastOpMap[args.ClientId]; ok {
+		if lastOpIdx >= args.CommandId {
+			// op索引已过期，直接返回，避免op重复执行
+			reply.Err = OK
+			kv.mu.Unlock()
+			DPrintf("%d put append return early, lastOpIdx %d, command id %d", kv.me, lastOpIdx, args.CommandId)
+			return
+		}
+	}
+
+	// 向raft log发送op request
+	op := Op{
+		Key:       args.Key,
+		Value:     args.Value,
+		Op:        args.Op,
+		ClientId:  args.ClientId,
+		CommandId: args.CommandId,
+	}
+	toCommitIdx, term, isLeader := kv.rf.Start(op)
+	DPrintf("%d put toCommitIdx %d, term %d, isLeader %t", kv.me, toCommitIdx, term, isLeader)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		kv.mu.Unlock()
+		return
+	}
+
+	// 创建toCommitIdx对应的响应channel
+	replyCh := make(chan ReplyMsg)
+	kv.replyChMap[toCommitIdx] = replyCh
+	kv.mu.Unlock()
+
+	// 等待execOp后的响应
+	select {
+	case replyMsg := <-replyCh:
+		reply.Err = replyMsg.Err
+	case <-time.After(500 * time.Millisecond):
+		DPrintf("%d wait reply timeout", kv.me)
+		reply.Err = ErrTimeOut
+	}
+
+	go kv.freeReplyMap(toCommitIdx)
+}
+
+func (kv *KVServer) execOp() {
+	// 逐个应用raft已commit的op
+	for !kv.killed() {
+		select {
+		case msg := <-kv.applyCh:
+			// 从applyCh中获取已提交的op
+			op := msg.Command.(Op)
+			commitIdx := msg.CommandIndex
+			replyTerm := msg.CommandTerm
+			kv.mu.Lock()
+			DPrintf("%d op %s, clientId %d, commandId %d, commitIdx %d, term %d, key %s, value %s", kv.me, op.Op, op.ClientId, op.CommandId, commitIdx, replyTerm, op.Key, op.Value)
+			var replyMsg ReplyMsg
+
+			// 判断op是否过期
+			if lastOpIdx, ok := kv.lastOpMap[op.ClientId]; ok {
+				if lastOpIdx >= op.CommandId {
+					// 过期，放任超时
+					kv.mu.Unlock()
+					DPrintf("%d stale op, lastOpIdx %d, client id %d, command id %d", kv.me, lastOpIdx, op.ClientId, op.CommandId)
+					continue
+				}
+			}
+			// op为全新op，执行
+			if op.Op == "Get" {
+				// 读取Key，不影响database
+				kv.GetValRM(op.Key, &replyMsg)
+			} else if op.Op == "Put" {
+				// 直接设置key
+				kv.database[op.Key] = op.Value
+				replyMsg = ReplyMsg{OK, op.Value}
+			} else {
+				// append
+				if oldVal, ok := kv.database[op.Key]; ok {
+					// key存在，append
+					kv.database[op.Key] = oldVal + op.Value
+				} else {
+					// key不存在，replace
+					kv.database[op.Key] = op.Value
+				}
+				replyMsg = ReplyMsg{OK, kv.database[op.Key]}
+			}
+
+			// 判断term是否过期
+			term, isLeader := kv.rf.GetState()
+			// 如果exec时的当前term跟op提交时一致，并且kv依然是leader，则成功响应，否则放任超时
+			if replyCh, ok := kv.replyChMap[commitIdx]; ok && term == replyTerm && isLeader {
+				replyCh <- replyMsg
+			}
+			// 更新对应client的最新op id
+			kv.lastOpMap[op.ClientId] = op.CommandId
+			kv.mu.Unlock()
+		}
+	}
+
 }
 
 //
@@ -95,7 +280,14 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
+	kv.database = make(map[string]string)
+	kv.lastOpMap = make(map[int]int)
+	kv.replyChMap = make(map[int]chan ReplyMsg)
+
 	// You may need initialization code here.
+
+	// 起一个携程，不断执行从raft log commit的op
+	go kv.execOp()
 
 	return kv
 }

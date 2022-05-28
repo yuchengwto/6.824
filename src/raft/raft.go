@@ -47,6 +47,7 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+	CommandTerm  int
 
 	// For 2D:
 	SnapshotValid bool
@@ -397,6 +398,7 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+	XIndex  int // follower在prevlogindex处无日志时，记录follower的最后日志索引，否者为-1
 }
 
 func (rf *Raft) toFollower() {
@@ -444,6 +446,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// 设置回复的默认值
 	reply.Success = true
+	reply.XIndex = -1
 
 	if rf.currentTerm <= args.Term {
 		// 如果对方term未过期，刷新选举timer
@@ -460,28 +463,29 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		args.LeaderId, rf.me, rf.lastApplied, len(rf.log), len(args.Entries), rf.commitIndex, args.LeaderCommit, rf.currentTerm, args.Term, rf.lastIncludedIndex, rf.lastIncludedTerm, args.PrevLogIndex, args.PrevLogTerm)
 
 	if args.PrevLogIndex < rf.lastIncludedIndex {
-		DPrintf("pIdx小于peer lastIncludedIndex\n")
+		DPrintf("%d pIdx小于peer lastIncludedIndex\n", rf.me)
 		return
 	}
 
 	// 下面都是append entries的判断
 	if args.Term < rf.currentTerm {
 		// leader的任期过期，拒绝
-		DPrintf("leader过期，拒绝\n")
+		DPrintf("%d leader过期，拒绝\n", rf.me)
 		reply.Success = false
 		return
 	}
 
 	if rf.logIdxToAbsIdx(len(rf.log)-1) < args.PrevLogIndex {
 		// PrevLogIndex超过peer的log索引上限，拒绝
-		DPrintf("pIdx越界，拒绝\n")
+		DPrintf("%d pIdx越界，拒绝\n", rf.me)
 		reply.Success = false
+		reply.XIndex = rf.logIdxToAbsIdx(len(rf.log) - 1)
 		return
 	}
 
 	if rf.absIdxToLogIdx(args.PrevLogIndex) >= 0 && rf.log[rf.absIdxToLogIdx(args.PrevLogIndex)].Term != args.PrevLogTerm {
 		// 出现冲突，拒绝
-		DPrintf("term冲突，拒绝，pIdx term %d, leader term %d\n", rf.log[rf.absIdxToLogIdx(args.PrevLogIndex)].Term, args.PrevLogTerm)
+		DPrintf("%d term冲突，拒绝，peer pidx term %d, leader pt %d\n", rf.me, rf.log[rf.absIdxToLogIdx(args.PrevLogIndex)].Term, args.PrevLogTerm)
 		reply.Success = false
 		return
 	}
@@ -496,14 +500,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		log_idx = rf.absIdxToLogIdx(args.PrevLogIndex + idx + 1)
 		if log_idx >= len(rf.log) {
 			// 该idx位置开始的entries为新增entries，追加到peer的log后
-			DPrintf("追加数据\n")
+			DPrintf("%d 追加数据\n", rf.me)
 			rf.log = append(rf.log, args.Entries[idx:]...)
 			break
 		}
 
 		if args.Entries[idx].Term != rf.log[log_idx].Term {
 			// 冲突发生了
-			DPrintf("擦除冲突数据\n")
+			DPrintf("%d 擦除冲突数据\n", rf.me)
 			rf.log = rf.log[:log_idx]
 			// 再将后续entries追加
 			rf.log = append(rf.log, args.Entries[idx:]...)
@@ -685,7 +689,7 @@ func (rf *Raft) AppendEntriesWrap(server int) {
 
 		if !reply.Success {
 			// 响应Success为false
-			rf.onLogReplyFail(args.PrevLogIndex, args.PrevLogTerm, server)
+			rf.onLogReplyFail(reply.XIndex, args.PrevLogIndex, args.PrevLogTerm, server)
 		} else {
 			rf.onLogReplySucceed(args.PrevLogIndex+len(args.Entries), server)
 		}
@@ -697,8 +701,13 @@ func (rf *Raft) onLogReplySucceed(matchIndex int, server int) {
 	rf.nextIndex[server] = matchIndex + 1
 }
 
-func (rf *Raft) onLogReplyFail(prevLogIndex int, prevLogTerm int, server int) {
-	DPrintf("%d append log fail, peer lastIncludedIdx %d, adjust nextIndex[%d], pIdx %d, pt %d, previous nextIdx %d\n", rf.me, rf.lastIncludedIndex, server, prevLogIndex, prevLogTerm, rf.nextIndex[server])
+func (rf *Raft) onLogReplyFail(xindex int, prevLogIndex int, prevLogTerm int, server int) {
+	DPrintf("%d append log fail, peer lastIncludedIdx %d, adjust nextIndex[%d], pIdx %d, pt %d, xindex %d, previous nextIdx %d\n", rf.me, rf.lastIncludedIndex, server, prevLogIndex, prevLogTerm, xindex, rf.nextIndex[server])
+	if xindex >= 0 {
+		// prevlogindex越界，修改prevlogindex为xindex
+		prevLogIndex = xindex
+	}
+
 	for {
 		if rf.absIdxToLogIdx((prevLogIndex)) < 0 {
 			// 越界
@@ -904,7 +913,7 @@ func (rf *Raft) checkApply() {
 			commandIdx := lastApplied + 1 + idx
 			DPrintf("%d apply command index: %d\n", rf.me, commandIdx)
 			// apply时需要解锁
-			rf.applyCh <- ApplyMsg{CommandValid: true, Command: command, CommandIndex: commandIdx}
+			rf.applyCh <- ApplyMsg{CommandValid: true, Command: command, CommandIndex: commandIdx, CommandTerm: entry.Term}
 		}
 
 		rf.mu.Lock()
