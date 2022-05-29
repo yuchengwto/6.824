@@ -21,7 +21,6 @@ import (
 	//	"bytes"
 
 	"bytes"
-	"fmt"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -128,6 +127,14 @@ func (rf *Raft) GetState() (int, bool) {
 	return term, isleader
 }
 
+func (rf *Raft) GetRaftStateSize() int {
+	return rf.persister.RaftStateSize()
+}
+
+func (rf *Raft) GetSnapshot() []byte {
+	return rf.persister.ReadSnapshot()
+}
+
 //
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
@@ -157,12 +164,7 @@ func (rf *Raft) persistStateAndSnapshot() {
 	e.Encode(rf.lastIncludedTerm)
 	data := w.Bytes()
 
-	// snapshot data
-	sw := new(bytes.Buffer)
-	se := labgob.NewEncoder(sw)
-	se.Encode(rf.snapshotState)
-	sdata := sw.Bytes()
-	rf.persister.SaveStateAndSnapshot(data, sdata)
+	rf.persister.SaveStateAndSnapshot(data, rf.snapshotState)
 }
 
 //
@@ -181,7 +183,7 @@ func (rf *Raft) readPersist(data []byte) {
 	var lastIncludedIndex int
 	var lastIncludedTerm int
 	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&log) != nil || d.Decode(&lastIncludedIndex) != nil || d.Decode(&lastIncludedTerm) != nil {
-		fmt.Println("decode error......")
+		DPrintf("%d decode error......", rf.me)
 	} else {
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
@@ -196,14 +198,7 @@ func (rf *Raft) readSnapshot(data []byte) {
 		return
 	}
 
-	r := bytes.NewBuffer(data)
-	d := labgob.NewDecoder(r)
-	var snapshotState []byte
-	if d.Decode(&snapshotState) != nil {
-		fmt.Println("decode error......")
-	} else {
-		rf.snapshotState = snapshotState
-	}
+	rf.snapshotState = data
 }
 
 //
@@ -211,11 +206,12 @@ func (rf *Raft) readSnapshot(data []byte) {
 // have more recent info since it communicate the snapshot on applyCh.
 //
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
-	DPrintf("%d cond install snapshot\n", rf.me)
+	DPrintf("%d switch to snapshot in rf layer, lastIncludedTerm %d, lastIncludedIndex %d", rf.me, lastIncludedTerm, lastIncludedIndex)
 
 	// Your code here (2D).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	DPrintf("%d switch to snapshot get lock\n", rf.me)
 
 	if rf.commitIndex >= lastIncludedIndex {
 		// refuse过期的snapshot
@@ -286,42 +282,43 @@ type InstallSnapshotReply struct {
 
 // InstallSnapshot handler.
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
-	DPrintf("%d install snapshot\n", rf.me)
+	DPrintf("%d get snapshot in rf layer", rf.me)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	defer rf.persist()
-	defer func() {
-		reply.Term = rf.currentTerm
-	}()
+	reply.Term = rf.currentTerm
 
-	DPrintf("installsnapshot==>%d to %d: my last apply %d, my log length %d; my commit %d, my term %d, leader term %d; peer lastIncludedIndex %d, peer lastIncludedTerm %d; leader lastIncludedIndex %d, leader lastIncludedTerm %d\n",
+	DPrintf("%d to %d 快照回调: my last apply %d, my log length %d; my commit %d, my term %d, leader term %d; peer lastIncludedIndex %d, peer lastIncludedTerm %d; leader lastIncludedIndex %d, leader lastIncludedTerm %d\n",
 		args.LeaderId, rf.me, rf.lastApplied, len(rf.log), rf.commitIndex, rf.currentTerm, args.Term, rf.lastIncludedIndex, rf.lastIncludedTerm, args.LastIncludedIndex, args.LastIncludedTerm)
 
 	if args.Term < rf.currentTerm {
 		// 对方term过期，拒绝，直接返回
+		DPrintf("%d term过期，拒绝", rf.me)
 		return
 	}
 
-	if args.Term > rf.currentTerm {
-		// 如果对方term更新，更新到该任期，转换为follower
+	if rf.currentTerm < args.Term {
+		// 如果对方的term更优，将peer的term更新到对方的term，同时转换状态为follower
 		rf.currentTerm = args.Term
 		rf.toFollower()
 	}
-
-	// 刷新时间
 	rf.flushElectionTimer()
+	// anyway，transform to FOLLOWER
+	rf.role = FOLLOWER
 
 	if args.LastIncludedIndex <= rf.commitIndex {
 		// 快照过期，不推入channel直接返回
+		DPrintf("%d 快照过期，拒绝", rf.me)
 		return
 	}
 
 	// 将待install的snapshot推入apply channel
 	go func() {
-		rf.mu.Lock()
-		defer rf.mu.Unlock()
-		rf.applyCh <- ApplyMsg{CommandValid: false, SnapshotValid: true, SnapshotTerm: args.LastIncludedTerm,
-			SnapshotIndex: args.LastIncludedIndex, Snapshot: args.Data}
+		rf.applyCh <- ApplyMsg{CommandValid: false, SnapshotValid: true,
+			SnapshotTerm:  args.LastIncludedTerm,
+			SnapshotIndex: args.LastIncludedIndex,
+			Snapshot:      args.Data}
+		DPrintf("%d 已将快照推入apply channel, term %d, index %d", rf.me, args.LastIncludedTerm, args.LastIncludedIndex)
 	}()
 }
 
@@ -440,38 +437,34 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	defer rf.persist()
-	defer func() {
-		reply.Term = rf.currentTerm
-	}()
 
 	// 设置回复的默认值
+	reply.Term = rf.currentTerm
 	reply.Success = true
 	reply.XIndex = -1
 
-	if rf.currentTerm <= args.Term {
-		// 如果对方term未过期，刷新选举timer
-		rf.flushElectionTimer()
-
-		if rf.currentTerm < args.Term {
-			// 如果对方的term更优，将peer的term更新到对方的term，同时转换状态为follower
-			rf.currentTerm = args.Term
-			rf.toFollower()
-		}
-	}
-
-	DPrintf("appendentries==>%d to %d: my last apply %d, my log length %d, received entries length %d; my commit %d, leader commit %d; my term %d, leader term %d; peer lastIncludedIndex %d, peer lastIncludedTerm %d; pidx %d, pt %d\n",
+	DPrintf("%d to %d 追加回调: my last apply %d, my log length %d, received entries length %d; my commit %d, leader commit %d; my term %d, leader term %d; peer lastIncludedIndex %d, peer lastIncludedTerm %d; pidx %d, pt %d\n",
 		args.LeaderId, rf.me, rf.lastApplied, len(rf.log), len(args.Entries), rf.commitIndex, args.LeaderCommit, rf.currentTerm, args.Term, rf.lastIncludedIndex, rf.lastIncludedTerm, args.PrevLogIndex, args.PrevLogTerm)
-
-	if args.PrevLogIndex < rf.lastIncludedIndex {
-		DPrintf("%d pIdx小于peer lastIncludedIndex\n", rf.me)
-		return
-	}
 
 	// 下面都是append entries的判断
 	if args.Term < rf.currentTerm {
 		// leader的任期过期，拒绝
 		DPrintf("%d leader过期，拒绝\n", rf.me)
 		reply.Success = false
+		return
+	}
+
+	if rf.currentTerm < args.Term {
+		// 如果对方的term更优，将peer的term更新到对方的term，同时转换状态为follower
+		rf.currentTerm = args.Term
+		rf.toFollower()
+	}
+	rf.flushElectionTimer()
+	// anyway，transform to FOLLOWER
+	rf.role = FOLLOWER
+
+	if args.PrevLogIndex < rf.lastIncludedIndex {
+		DPrintf("%d pIdx小于peer lastIncludedIndex\n", rf.me)
 		return
 	}
 
@@ -535,12 +528,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 // 向所有followers同步command
 func (rf *Raft) replicateLog(cmd interface{}) int {
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	defer rf.persist()
 	// local log添加cmd
 	rf.log = append(rf.log, LogEntry{cmd, rf.currentTerm})
-	rf.persist()
 	// 日志最终commit时的索引，为绝对索引
 	toCommitIdx := rf.logIdxToAbsIdx(len(rf.log) - 1)
-	rf.mu.Unlock()
 
 	// 立马开始一轮广播
 	go rf.broadCast()
@@ -575,6 +568,7 @@ type ValueCount struct {
 }
 
 func (rf *Raft) findMatchMajority() int {
+	// 找到match index中最大的major值
 	max := 0
 	for _, v := range rf.matchIndex {
 		if v > max {
@@ -626,6 +620,7 @@ func (rf *Raft) AppendEntriesWrap(server int) {
 	// 参数赋值
 	rf.mu.Lock()
 	if rf.nextIndex[server] <= rf.lastIncludedIndex {
+		DPrintf("%d snapshot to %d. nextIndex %d, lastIncludedIndex %d", rf.me, server, rf.nextIndex[server], rf.lastIncludedIndex)
 		// install snapshot
 		args := InstallSnapshotArgs{
 			Term:              rf.currentTerm,
@@ -640,6 +635,7 @@ func (rf *Raft) AppendEntriesWrap(server int) {
 		ok := rf.peers[server].Call("Raft.InstallSnapshot", &args, &reply)
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
+		defer rf.persist()
 		if rf.role != LEADER || args.Term != rf.currentTerm {
 			return
 		}
@@ -666,7 +662,7 @@ func (rf *Raft) AppendEntriesWrap(server int) {
 		args.Entries = make([]LogEntry, len(rf.log[rf.absIdxToLogIdx(rf.nextIndex[server]):]))
 		copy(args.Entries, rf.log[rf.absIdxToLogIdx(rf.nextIndex[server]):])
 		args.LeaderCommit = rf.commitIndex
-		DPrintf("%d send to %d: pIdx %d, sender lastIncludedIndex %d\n", rf.me, server, args.PrevLogIndex, rf.lastIncludedIndex)
+		DPrintf("%d append to %d: pIdx %d, sender lastIncludedIndex %d\n", rf.me, server, args.PrevLogIndex, rf.lastIncludedIndex)
 		rf.mu.Unlock()
 		// 发出rpc
 		ok := rf.peers[server].Call("Raft.AppendEntries", &args, &reply)
@@ -738,10 +734,10 @@ func (rf *Raft) GetVoteWrap(server int, ch chan<- bool) {
 	args.LastLogTerm = rf.lastLog().Term
 	rf.mu.Unlock()
 	ok := rf.peers[server].Call("Raft.RequestVote", &args, &reply)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	if ok {
-		rf.mu.Lock()
 		rf.adjustReplyTerm(reply.Term)
-		rf.mu.Unlock()
 		ch <- reply.VoteGranted
 	}
 }
@@ -808,6 +804,7 @@ func (rf *Raft) flushHeartBeatTimer() {
 }
 
 func (rf *Raft) startElection() {
+	DPrintf("%d 宣布开始选举", rf.me)
 	rf.mu.Lock()
 	rf.toCandidator()
 	rf.persist()
@@ -820,7 +817,6 @@ func (rf *Raft) startElection() {
 		if rf.me == idx {
 			continue
 		}
-		// fmt.Printf("%d to %d req single\n", rf.me, idx)
 		go rf.GetVoteWrap(idx, chVotes)
 	}
 
@@ -869,6 +865,7 @@ func (rf *Raft) ticker() {
 
 		select {
 		case <-rf.timerElect.C:
+			DPrintf("%d election timeout!!", rf.me)
 			rf.mu.Lock()
 			if rf.role != LEADER {
 				go rf.startElection()
@@ -877,6 +874,7 @@ func (rf *Raft) ticker() {
 			rf.mu.Unlock()
 
 		case <-rf.timerHeartBeat.C:
+			DPrintf("%d heartbeat timeout!!", rf.me)
 			rf.mu.Lock()
 			if rf.role == LEADER {
 				go rf.broadCast()

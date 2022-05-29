@@ -73,7 +73,7 @@ func (ck *Clerk) Get(key string) string {
 		ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
 	}
 
-	DPrintf("%d get key return: %v => %v\n", ck.me, key, reply.Value)
+	// DPrintf("%d get key return: %v => %v\n", ck.me, key, reply.Value)
 	return reply.Value
 }
 

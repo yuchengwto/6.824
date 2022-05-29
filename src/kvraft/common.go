@@ -5,6 +5,7 @@ const (
 	ErrNoKey       = "ErrNoKey"
 	ErrWrongLeader = "ErrWrongLeader"
 	ErrTimeOut     = "ErrTimeOut"
+	ErrStaleOp     = "ErrStaleOp"
 )
 
 type Err string

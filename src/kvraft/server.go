@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -11,7 +12,7 @@ import (
 	"6.824/raft"
 )
 
-const Debug = true
+const Debug = false
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -116,7 +117,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	kv.replyChMap[toCommitIdx] = replyCh
 	kv.mu.Unlock()
 
-	// 等待execOp后的响应
+	// 等待execMsg后的响应
 	select {
 	case replyMsg := <-replyCh:
 		reply.Err = replyMsg.Err
@@ -150,8 +151,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		ClientId:  args.ClientId,
 		CommandId: args.CommandId,
 	}
-	toCommitIdx, term, isLeader := kv.rf.Start(op)
-	DPrintf("%d put toCommitIdx %d, term %d, isLeader %t", kv.me, toCommitIdx, term, isLeader)
+	toCommitIdx, _, isLeader := kv.rf.Start(op)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		kv.mu.Unlock()
@@ -163,7 +163,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.replyChMap[toCommitIdx] = replyCh
 	kv.mu.Unlock()
 
-	// 等待execOp后的响应
+	// 等待execMsg后的响应
 	select {
 	case replyMsg := <-replyCh:
 		reply.Err = replyMsg.Err
@@ -175,57 +175,149 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	go kv.freeReplyMap(toCommitIdx)
 }
 
-func (kv *KVServer) execOp() {
+func (kv *KVServer) overThreshold() bool {
+	// maxraftstate为-1说明不做限制，永远不会到达阈值
+	if kv.maxraftstate == -1 {
+		return false
+	}
+
+	// 90% maxraftstate设定为阈值
+	var prop float32
+	prop = float32(kv.rf.GetRaftStateSize()) / float32(kv.maxraftstate)
+	DPrintf("%d prop %f", kv.me, prop)
+	return prop >= 0.9
+}
+
+func (kv *KVServer) doKVSnapshot(index int) {
+	// kv database
+	// lastOpMap
+	// 需要做snapshot保存快照
+	b := new(bytes.Buffer)
+	e := labgob.NewEncoder(b)
+	err := e.Encode(kv.database)
+	if err != nil {
+		DPrintf("%d encode err %s", kv.me, err)
+		return
+	}
+
+	err = e.Encode(kv.lastOpMap)
+	if err != nil {
+		DPrintf("%d encode err %s", kv.me, err)
+		return
+	}
+
+	data := b.Bytes()
+	kv.rf.Snapshot(index, data)
+}
+
+func (kv *KVServer) loadKVSnapshot() {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	snapshot := kv.rf.GetSnapshot()
+	DPrintf("%d install snapshot, length %d", kv.me, len(snapshot))
+
+	if snapshot == nil || len(snapshot) < 1 {
+		return
+	}
+
+	b := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(b)
+	var database map[string]string
+	var lastOpMap map[int]int
+	err := d.Decode(&database)
+	if err != nil {
+		DPrintf("%d decode error %s", kv.me, err)
+		DPrintf(string(snapshot))
+	} else {
+		kv.database = database
+	}
+
+	err = d.Decode(&lastOpMap)
+	if err != nil {
+		DPrintf("%d decode error %s", kv.me, err)
+	} else {
+		kv.lastOpMap = lastOpMap
+	}
+}
+
+func (kv *KVServer) applyOp(msg raft.ApplyMsg) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	op := msg.Command.(Op)
+	commitIdx := msg.CommandIndex
+	replyTerm := msg.CommandTerm
+
+	DPrintf("%d op %s, clientId %d, commandId %d, commitIdx %d, term %d, key %s, value %s", kv.me, op.Op, op.ClientId, op.CommandId, commitIdx, replyTerm, op.Key, op.Value)
+	var replyMsg ReplyMsg
+
+	// 判断op是否过期
+	if lastOpIdx, ok := kv.lastOpMap[op.ClientId]; ok {
+		if lastOpIdx >= op.CommandId {
+			// 过期，放任超时
+			DPrintf("%d stale op, lastOpIdx %d, client id %d, command id %d", kv.me, lastOpIdx, op.ClientId, op.CommandId)
+			return
+		}
+	}
+
+	// op为全新op，执行
+	if op.Op == "Get" {
+		// 读取Key，不影响database
+		kv.GetValRM(op.Key, &replyMsg)
+	} else if op.Op == "Put" {
+		// 直接设置key
+		kv.database[op.Key] = op.Value
+		replyMsg = ReplyMsg{OK, ""}
+	} else {
+		// append
+		if oldVal, ok := kv.database[op.Key]; ok {
+			// key存在，append
+			kv.database[op.Key] = oldVal + op.Value
+		} else {
+			// key不存在，replace
+			kv.database[op.Key] = op.Value
+		}
+		replyMsg = ReplyMsg{OK, ""}
+	}
+
+	// 判断term是否过期
+	term, isLeader := kv.rf.GetState()
+	// 如果exec时的当前term跟op提交时一致，并且kv依然是leader，则成功响应，否则放任超时
+	if replyCh, ok := kv.replyChMap[commitIdx]; ok && isLeader && term == replyTerm {
+		replyCh <- replyMsg
+	}
+	// 更新对应client的最新op id
+	kv.lastOpMap[op.ClientId] = op.CommandId
+	// 判断是否需要snapshot
+	if kv.overThreshold() {
+		kv.doKVSnapshot(commitIdx)
+	}
+}
+
+func (kv *KVServer) applySnapshot(msg raft.ApplyMsg) {
+	if kv.rf.CondInstallSnapshot(msg.SnapshotTerm, msg.SnapshotIndex, msg.Snapshot) {
+		// raft协议层安装snapshot成功，kv service层再加载其state状态
+		DPrintf("%d cond install succeed in kv layer, loadKVSnapshot then", kv.me)
+		kv.loadKVSnapshot()
+	}
+	// 无需通过channel做任何通知
+}
+
+func (kv *KVServer) execMsg() {
 	// 逐个应用raft已commit的op
 	for !kv.killed() {
 		select {
 		case msg := <-kv.applyCh:
-			// 从applyCh中获取已提交的op
-			op := msg.Command.(Op)
-			commitIdx := msg.CommandIndex
-			replyTerm := msg.CommandTerm
-			kv.mu.Lock()
-			DPrintf("%d op %s, clientId %d, commandId %d, commitIdx %d, term %d, key %s, value %s", kv.me, op.Op, op.ClientId, op.CommandId, commitIdx, replyTerm, op.Key, op.Value)
-			var replyMsg ReplyMsg
-
-			// 判断op是否过期
-			if lastOpIdx, ok := kv.lastOpMap[op.ClientId]; ok {
-				if lastOpIdx >= op.CommandId {
-					// 过期，放任超时
-					kv.mu.Unlock()
-					DPrintf("%d stale op, lastOpIdx %d, client id %d, command id %d", kv.me, lastOpIdx, op.ClientId, op.CommandId)
-					continue
-				}
-			}
-			// op为全新op，执行
-			if op.Op == "Get" {
-				// 读取Key，不影响database
-				kv.GetValRM(op.Key, &replyMsg)
-			} else if op.Op == "Put" {
-				// 直接设置key
-				kv.database[op.Key] = op.Value
-				replyMsg = ReplyMsg{OK, op.Value}
+			// 从applyCh中获取已提交的msg
+			if msg.CommandValid {
+				kv.applyOp(msg)
+			} else if msg.SnapshotValid {
+				kv.applySnapshot(msg)
 			} else {
-				// append
-				if oldVal, ok := kv.database[op.Key]; ok {
-					// key存在，append
-					kv.database[op.Key] = oldVal + op.Value
-				} else {
-					// key不存在，replace
-					kv.database[op.Key] = op.Value
-				}
-				replyMsg = ReplyMsg{OK, kv.database[op.Key]}
+				DPrintf("%d error applied msg", kv.me)
+				kv.Kill()
 			}
-
-			// 判断term是否过期
-			term, isLeader := kv.rf.GetState()
-			// 如果exec时的当前term跟op提交时一致，并且kv依然是leader，则成功响应，否则放任超时
-			if replyCh, ok := kv.replyChMap[commitIdx]; ok && term == replyTerm && isLeader {
-				replyCh <- replyMsg
-			}
-			// 更新对应client的最新op id
-			kv.lastOpMap[op.ClientId] = op.CommandId
-			kv.mu.Unlock()
 		}
 	}
 
@@ -283,11 +375,12 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.database = make(map[string]string)
 	kv.lastOpMap = make(map[int]int)
 	kv.replyChMap = make(map[int]chan ReplyMsg)
+	// 加载缓存snapshot，用于reboot后的状态恢复
+	DPrintf("%d state restore after booting", kv.me)
+	kv.loadKVSnapshot()
 
-	// You may need initialization code here.
-
-	// 起一个携程，不断执行从raft log commit的op
-	go kv.execOp()
+	// 起一个携程，不断执行从raft log commit的op或snapshot
+	go kv.execMsg()
 
 	return kv
 }
