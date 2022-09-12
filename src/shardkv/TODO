@@ -1,0 +1,13 @@
+TODO
+1. server检查config变化，协程中<100ms一次
+2. 检测到config变化，进行shard迁移。立即停止对迁走shard的支持，并等待迁入shard的数据导入后支持新shard
+3. 迁移op应仅由group leader处理，follow pass
+3. 同一group的servers应在同一op点进行shard迁移，保证同一group的并发一致性
+4. at-most-once客户端最大一次语义的实现，也就是重复请求检查
+5. ErrWrongGroup情况下，client不更新commandId，server不更新client状态
+6. server可以保留旧shard的数据，这样简单点
+7. RPC直接发送整个map以简化实现
+8. RPC处理过程中，最好对map进行一次copy防止race
+9. log entry中的map或者slice也需要做copy防止race
+10. 一对group交换shard过程中可能导致死锁
+11. 内部通讯，应该不存在ErrWrongGroup
