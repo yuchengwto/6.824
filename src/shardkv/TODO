@@ -11,3 +11,4 @@ TODO
 9. log entry中的map或者slice也需要做copy防止race
 10. 一对group交换shard过程中可能导致死锁
 11. 内部通讯，应该不存在ErrWrongGroup
+12. 正在transferring的GID，不应作为fetch的目标，应等待下次fetch，防止死锁

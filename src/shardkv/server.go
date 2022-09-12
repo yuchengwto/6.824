@@ -31,13 +31,14 @@ type Op struct {
 	Value     string
 	Op        string
 	ShardId   int
-	NewConfig shardctrler.Config
+	Config    shardctrler.Config
 	ClientId  int
 	CommandId int
 }
 
 type ShardTransferArgs struct {
 	ShardId int
+	GID     int
 }
 
 type ShardTransferReply struct {
@@ -63,12 +64,13 @@ type ShardKV struct {
 
 	// Your definitions here.
 	// shardId -> subdatabase; key -> { commandId -> value }	commandId作为版本号，最新一条的id为-1
-	database   map[int]map[string]map[int]string
-	lastOpMap  map[int]int
-	replyChMap map[int]chan ReplyMsg
-	dead       int32
-	mck        *shardctrler.Clerk
-	config     shardctrler.Config
+	database         map[int]map[string]map[int]string
+	lastOpMap        map[int]int
+	replyChMap       map[int]chan ReplyMsg
+	dead             int32
+	mck              *shardctrler.Clerk
+	config           shardctrler.Config
+	transferringGIDs map[int]int
 }
 
 func (kv *ShardKV) checkShard(shardId int) bool {
@@ -257,8 +259,8 @@ func (kv *ShardKV) ShardChange() {
 	// 发送op到raft层
 	// group internal op
 	op := Op{
-		Op:        "ShardChange",
-		NewConfig: config,
+		Op:     "ShardChange",
+		Config: config,
 	}
 
 	toCommitIdx, _, isLeader := kv.rf.Start(op)
@@ -288,6 +290,9 @@ func (kv *ShardKV) ShardTransfer(args *ShardTransferArgs, reply *ShardTransferRe
 		return
 	}
 
+	// 将该gid加入transferringGIDs，避免双向通讯
+	kv.transferringGIDs[args.GID] = 1
+
 	// 创建toCommitIdx对应的响应channel
 	replyCh := make(chan ReplyMsg)
 	kv.replyChMap[toCommitIdx] = replyCh
@@ -310,10 +315,13 @@ func (kv *ShardKV) ShardTransfer(args *ShardTransferArgs, reply *ShardTransferRe
 			}
 		}
 	case <-time.After(500 * time.Millisecond):
+		DPrintf("%d of gid %d transfer shard timeout", kv.me, kv.gid)
 		reply.Err = ErrTimeOut
 	}
 
 	kv.mu.Lock()
+	// 结束后，将GID移出
+	delete(kv.transferringGIDs, args.GID)
 	go kv.freeReplyMap(toCommitIdx)
 
 }
@@ -441,7 +449,7 @@ func (kv *ShardKV) applyOp(msg raft.ApplyMsg) {
 		replyMsg.Err = OK
 		replyMsg.Value = ""
 	} else if op.Op == "ShardChange" {
-		kv.handleShardChange(op.NewConfig)
+		kv.handleShardChange(op.Config)
 		// ShardChange没有channel等待，函数完成后可以直接返回
 		return
 	} else if op.Op == "ShardTransfer" {
@@ -511,8 +519,14 @@ func (kv *ShardKV) fetchShardData(shardId int) bool {
 	// 获取待获取shard的原始地址gid
 	gid := kv.config.Shards[shardId]
 
+	// 如果对方gid已在transferring当中，直接返回false，等待下次fetch
+	if _, ok := kv.transferringGIDs[gid]; ok {
+		return false
+	}
+
 	args := ShardTransferArgs{
 		ShardId: shardId,
+		GID:     kv.gid,
 	}
 	reply := ShardTransferReply{
 		Err: OK,
@@ -523,7 +537,11 @@ func (kv *ShardKV) fetchShardData(shardId int) bool {
 		// try each server for the shard.
 		for si := 0; si < len(servers); si++ {
 			srv := kv.make_end(servers[si])
+			// 这里需要解锁一下，避免死锁
+			kv.mu.Unlock()
 			ok := srv.Call("ShardKV.ShardTransfer", &args, &reply)
+			kv.mu.Lock()
+
 			if ok && (reply.Err == OK) {
 				// shard数据导入
 				// 判断shard是否存在
@@ -577,6 +595,7 @@ func (kv *ShardKV) handleShardChange(config shardctrler.Config) {
 	// 逐个shard获取，获取过程中保持lock，即block
 	for _, shardId := range append_shards {
 		fetch_succeed = kv.fetchShardData(shardId)
+
 		if !fetch_succeed {
 			// 只要有一个失败，中断
 			DPrintf("%d of gid %d fetch shard %d FAILED", kv.me, kv.gid, shardId)
@@ -657,8 +676,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.database = make(map[int]map[string]map[int]string)
 	kv.lastOpMap = make(map[int]int)
 	kv.replyChMap = make(map[int]chan ReplyMsg)
-	// kv.clientId, _ = strconv.Atoi(strconv.Itoa(kv.gid) + "000" + strconv.Itoa(kv.me))
-	// kv.commandId = 0
+	kv.transferringGIDs = make(map[int]int)
 
 	// Use something like this to talk to the shardctrler:
 	kv.mck = shardctrler.MakeClerk(kv.ctrlers)
