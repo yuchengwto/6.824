@@ -12,3 +12,5 @@ TODO
 10. 一对group交换shard过程中可能导致死锁
 11. 内部通讯，应该不存在ErrWrongGroup
 12. 正在transferring的GID，不应作为fetch的目标，应等待下次fetch，防止死锁
+13. 传输的sharddata应该包括该shard的lastOp信息，防止client重复提交
+14. group间的数据交互应该仅由leader进行，fetch data后再以log的形式分发给整个group，防止follower各自fetch由于延时或宕机导致的不一致

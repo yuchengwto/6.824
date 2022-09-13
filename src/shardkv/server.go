@@ -13,7 +13,7 @@ import (
 	"6.824/shardctrler"
 )
 
-const Debug = false
+const Debug = true
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -174,6 +174,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		reply.Err = replyMsg.Err
 		reply.Value = replyMsg.Value
 	case <-time.After(500 * time.Millisecond):
+		DPrintf("%d of gid %d get in shard %d TIMEOUT", kv.me, kv.gid, args.ShardId)
 		reply.Err = ErrTimeOut
 	}
 
@@ -228,7 +229,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	case replyMsg := <-replyCh:
 		reply.Err = replyMsg.Err
 	case <-time.After(500 * time.Millisecond):
-		DPrintf("%d wait reply timeout", kv.me)
+		DPrintf("%d of gid %d putappend in shard %d TIMEOUT", kv.me, kv.gid, args.ShardId)
 		reply.Err = ErrTimeOut
 	}
 
@@ -268,6 +269,24 @@ func (kv *ShardKV) ShardChange() {
 		return
 	}
 
+	// 创建toCommitIdx对应的响应channel
+	replyCh := make(chan ReplyMsg)
+	kv.replyChMap[toCommitIdx] = replyCh
+	kv.mu.Unlock()
+
+	// 等待execMsg后的响应
+	select {
+	case replyMsg := <-replyCh:
+		if replyMsg.Err == OK {
+			DPrintf("%d of gid %d ShardChange SUCCEED", kv.me, kv.gid)
+		} else {
+			DPrintf("%d of gid %d ShardChange FAILED", kv.me, kv.gid)
+		}
+	case <-time.After(500 * time.Millisecond):
+		DPrintf("%d of gid %d ShardChange TIMEOUT", kv.me, kv.gid)
+	}
+
+	kv.mu.Lock()
 	go kv.freeReplyMap(toCommitIdx)
 }
 
@@ -315,7 +334,7 @@ func (kv *ShardKV) ShardTransfer(args *ShardTransferArgs, reply *ShardTransferRe
 			}
 		}
 	case <-time.After(500 * time.Millisecond):
-		DPrintf("%d of gid %d transfer shard timeout", kv.me, kv.gid)
+		DPrintf("%d of gid %d transfer shard %d to %d TIMEOUT", kv.me, kv.gid, args.ShardId, args.GID)
 		reply.Err = ErrTimeOut
 	}
 
@@ -450,8 +469,9 @@ func (kv *ShardKV) applyOp(msg raft.ApplyMsg) {
 		replyMsg.Value = ""
 	} else if op.Op == "ShardChange" {
 		kv.handleShardChange(op.Config)
-		// ShardChange没有channel等待，函数完成后可以直接返回
-		return
+		replyMsg.Err = OK
+		// // ShardChange没有channel等待，函数完成后可以直接返回
+		// return
 	} else if op.Op == "ShardTransfer" {
 		// copy shard data to replyMsg
 		replyMsg.ShardData = make(map[string]map[int]string)
@@ -480,7 +500,8 @@ func (kv *ShardKV) applyOp(msg raft.ApplyMsg) {
 		replyCh <- replyMsg
 	}
 	// 更新对应client的最新op id
-	if replyMsg.Err == OK {
+	// 仅更新get和putappend相关op
+	if op.Op != "ShardChange" && op.Op != "ShardTransfer" && replyMsg.Err == OK {
 		kv.lastOpMap[op.ClientId] = op.CommandId
 	}
 	// 判断是否需要snapshot
@@ -572,6 +593,7 @@ func (kv *ShardKV) handleShardChange(config shardctrler.Config) {
 
 	// 判断config number，若new_config编号没有更新，则直接返回
 	if config.Num <= kv.config.Num {
+		DPrintf("%d of gid %d new config number %d not bigger than old %d", kv.me, kv.gid, config.Num, kv.config.Num)
 		return
 	}
 
