@@ -31,6 +31,7 @@ type PutAppendArgs struct {
 	ClientId  int
 	CommandId int
 	ShardId   int
+	ConfigNum int
 }
 
 type PutAppendReply struct {
@@ -43,6 +44,7 @@ type GetArgs struct {
 	ClientId  int
 	CommandId int
 	ShardId   int
+	ConfigNum int
 }
 
 type GetReply struct {

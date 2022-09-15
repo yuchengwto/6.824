@@ -89,6 +89,7 @@ func (ck *Clerk) Get(key string) string {
 		ck.config = ck.sm.Query(-1)
 		shard := key2shard(key)
 		args.ShardId = shard
+		args.ConfigNum = ck.config.Num
 		gid := ck.config.Shards[shard]
 		if servers, ok := ck.config.Groups[gid]; ok {
 			// try each server for the shard.
@@ -131,6 +132,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		ck.config = ck.sm.Query(-1)
 		shard := key2shard(key)
 		args.ShardId = shard
+		args.ConfigNum = ck.config.Num
 		gid := ck.config.Shards[shard]
 		if servers, ok := ck.config.Groups[gid]; ok {
 			for si := 0; si < len(servers); si++ {

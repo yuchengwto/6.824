@@ -259,13 +259,13 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 	}
 
 	toCommitIdx, _, isLeader := sc.rf.Start(op)
-	DPrintf("%d query to commitIdx %d, isLeader %t\n", sc.me, toCommitIdx, isLeader)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		reply.WrongLeader = true
 		sc.mu.Unlock()
 		return
 	}
+	DPrintf("%d query to commitIdx %d, config number %d\n", sc.me, toCommitIdx, args.Num)
 
 	replyCh := make(chan ReplyMsg)
 	sc.replyChMap[toCommitIdx] = replyCh
@@ -515,7 +515,7 @@ func (sc *ShardCtrler) handleQuery(args *QueryArgs, reply *ReplyMsg) {
 	} else {
 		reply.Config = sc.configs[n]
 	}
-	DPrintf("%d query shard: %v", sc.me, reply.Config.Shards)
+	DPrintf("%d query number: %d, shard: %v", sc.me, args.Num, reply.Config.Shards)
 }
 
 func (sc *ShardCtrler) handleMove(args *MoveArgs, reply *ReplyMsg) {
@@ -632,14 +632,15 @@ func (sc *ShardCtrler) applyOp(msg raft.ApplyMsg) {
 		sc.handleMove(&args, &replyMsg)
 	}
 
+	// 更新对应client的最新op id
+	sc.lastOpMap[op.ClientId] = op.CommandId
+
 	// 判断term是否过期
 	term, isLeader := sc.rf.GetState()
 	// 如果exec时的当前term跟op提交时一致，并且sc依然是leader，则成功响应，否则放任超时
 	if replyCh, ok := sc.replyChMap[commitIdx]; ok && isLeader && term == replyTerm {
 		replyCh <- replyMsg
 	}
-	// 更新对应client的最新op id
-	sc.lastOpMap[op.ClientId] = op.CommandId
 }
 
 //
