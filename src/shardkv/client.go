@@ -110,8 +110,6 @@ func (ck *Clerk) Get(key string) string {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-
-	return ""
 }
 
 //

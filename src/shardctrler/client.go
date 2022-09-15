@@ -55,7 +55,7 @@ func (ck *Clerk) Query(num int) Config {
 			return reply.Config
 		}
 
-		if ok && reply.WrongLeader == false {
+		if ok && reply.Err == OK {
 			ck.commandId++
 			return reply.Config
 		}
@@ -81,7 +81,7 @@ func (ck *Clerk) Join(servers map[int][]string) {
 			return
 		}
 
-		if ok && reply.WrongLeader == false {
+		if ok && reply.Err == OK {
 			// 执行成功，commandid+1
 			ck.commandId += 1
 			return
@@ -108,7 +108,7 @@ func (ck *Clerk) Leave(gids []int) {
 			return
 		}
 
-		if ok && reply.WrongLeader == false {
+		if ok && reply.Err == OK {
 			ck.commandId += 1
 			return
 		}
@@ -135,7 +135,7 @@ func (ck *Clerk) Move(shard int, gid int) {
 			return
 		}
 
-		if ok && reply.WrongLeader == false {
+		if ok && reply.Err == OK {
 			ck.commandId += 1
 			return
 		}

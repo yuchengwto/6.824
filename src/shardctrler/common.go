@@ -31,7 +31,6 @@ type Config struct {
 const (
 	OK             = "OK"
 	ErrDup         = "ErrDup"
-	ErrJson        = "ErrJson"
 	ErrWrongLeader = "ErrWrongLeader"
 	ErrTimeOut     = "ErrTimeOut"
 )
@@ -45,8 +44,7 @@ type JoinArgs struct {
 }
 
 type JoinReply struct {
-	WrongLeader bool
-	Err         Err
+	Err Err
 }
 
 type LeaveArgs struct {
@@ -56,8 +54,7 @@ type LeaveArgs struct {
 }
 
 type LeaveReply struct {
-	WrongLeader bool
-	Err         Err
+	Err Err
 }
 
 type MoveArgs struct {
@@ -68,8 +65,7 @@ type MoveArgs struct {
 }
 
 type MoveReply struct {
-	WrongLeader bool
-	Err         Err
+	Err Err
 }
 
 type QueryArgs struct {
@@ -79,7 +75,6 @@ type QueryArgs struct {
 }
 
 type QueryReply struct {
-	WrongLeader bool
-	Err         Err
-	Config      Config
+	Err    Err
+	Config Config
 }

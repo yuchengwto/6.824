@@ -38,9 +38,8 @@ func max(a, b int) int {
 }
 
 type ReplyMsg struct {
-	WrongLeader bool
-	Err         Err
-	Config      Config
+	Err    Err
+	Config Config
 }
 
 type ShardCtrler struct {
@@ -74,25 +73,39 @@ func (sc *ShardCtrler) freeReplyMap(index int) {
 	delete(sc.replyChMap, index)
 }
 
+func copyConfig(trg *Config, src *Config) {
+	trg.Num = src.Num
+	trg.Shards = src.Shards
+	trg.Groups = make(map[int][]string)
+	for k, v := range src.Groups {
+		if _, ok := trg.Groups[k]; !ok {
+			trg.Groups[k] = make([]string, 0)
+		}
+
+		trg.Groups[k] = append(trg.Groups[k], v...)
+	}
+}
+
 func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 	// Your code here.
 	sc.mu.Lock()
+	defer sc.mu.Unlock()
+
+	_, isLeader := sc.rf.GetState()
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
 	if lastOpIdx, ok := sc.lastOpMap[args.ClientId]; ok {
 		if lastOpIdx >= args.CommandId {
 			reply.Err = ErrDup
 			DPrintf("%d Join duplicated, client id: %d, command id: %d", sc.me, args.ClientId, args.CommandId)
-			sc.mu.Unlock()
 			return
 		}
 	}
 
-	Args, err := json.Marshal(args)
-	if err != nil {
-		reply.Err = ErrJson
-		DPrintf("%d Json failed, client id: %d, command id: %d", sc.me, args.ClientId, args.CommandId)
-		sc.mu.Unlock()
-		return
-	}
+	Args, _ := json.Marshal(args)
 	op := Op{
 		Op:        "Join",
 		Args:      Args,
@@ -101,11 +114,8 @@ func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 	}
 
 	toCommitIdx, _, isLeader := sc.rf.Start(op)
-	DPrintf("%d join to commitIdx %d, isLeader %t\n", sc.me, toCommitIdx, isLeader)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
-		reply.WrongLeader = true
-		sc.mu.Unlock()
 		return
 	}
 
@@ -117,33 +127,33 @@ func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 	select {
 	case replyMsg := <-replyCh:
 		reply.Err = replyMsg.Err
-		reply.WrongLeader = replyMsg.WrongLeader
 	case <-time.After(500 * time.Millisecond):
 		reply.Err = ErrTimeOut
 	}
 
+	sc.mu.Lock()
 	go sc.freeReplyMap(toCommitIdx)
 }
 
 func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
 	// Your code here.
 	sc.mu.Lock()
+	defer sc.mu.Unlock()
+
+	_, isLeader := sc.rf.GetState()
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
 	if lastOpIdx, ok := sc.lastOpMap[args.ClientId]; ok {
 		if lastOpIdx >= args.CommandId {
 			reply.Err = ErrDup
 			DPrintf("%d Leave duplicated, client id: %d, command id: %d", sc.me, args.ClientId, args.CommandId)
-			sc.mu.Unlock()
 			return
 		}
 	}
 
-	Args, err := json.Marshal(args)
-	if err != nil {
-		reply.Err = ErrJson
-		DPrintf("Json failed. server id: %d, client id: %d, command id: %d", sc.me, args.ClientId, args.CommandId)
-		sc.mu.Unlock()
-		return
-	}
+	Args, _ := json.Marshal(args)
 	op := Op{
 		Op:        "Leave",
 		Args:      Args,
@@ -152,11 +162,9 @@ func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
 	}
 
 	toCommitIdx, _, isLeader := sc.rf.Start(op)
-	DPrintf("%d leave to commitIdx %d, isLeader %t\n", sc.me, toCommitIdx, isLeader)
+	// DPrintf("%d leave to commitIdx %d, isLeader %t\n", sc.me, toCommitIdx, isLeader)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
-		reply.WrongLeader = true
-		sc.mu.Unlock()
 		return
 	}
 
@@ -168,33 +176,34 @@ func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
 	select {
 	case replyMsg := <-replyCh:
 		reply.Err = replyMsg.Err
-		reply.WrongLeader = replyMsg.WrongLeader
 	case <-time.After(500 * time.Millisecond):
 		reply.Err = ErrTimeOut
 	}
 
+	sc.mu.Lock()
 	go sc.freeReplyMap(toCommitIdx)
 }
 
 func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
 	// Your code here.
 	sc.mu.Lock()
+	defer sc.mu.Unlock()
+
+	_, isLeader := sc.rf.GetState()
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
 	if lastOpIdx, ok := sc.lastOpMap[args.ClientId]; ok {
 		if lastOpIdx >= args.CommandId {
 			reply.Err = ErrDup
 			DPrintf("%d Move duplicated, client id: %d, command id: %d", sc.me, args.ClientId, args.CommandId)
-			sc.mu.Unlock()
 			return
 		}
 	}
 
-	Args, err := json.Marshal(args)
-	if err != nil {
-		reply.Err = ErrJson
-		DPrintf("Json failed. server id: %d, client id: %d, command id: %d", sc.me, args.ClientId, args.CommandId)
-		sc.mu.Unlock()
-		return
-	}
+	Args, _ := json.Marshal(args)
 	op := Op{
 		Op:        "Move",
 		Args:      Args,
@@ -203,11 +212,9 @@ func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
 	}
 
 	toCommitIdx, _, isLeader := sc.rf.Start(op)
-	DPrintf("%d move to commitIdx %d, isLeader %t\n", sc.me, toCommitIdx, isLeader)
+	// DPrintf("%d move to commitIdx %d, isLeader %t\n", sc.me, toCommitIdx, isLeader)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
-		reply.WrongLeader = true
-		sc.mu.Unlock()
 		return
 	}
 
@@ -219,17 +226,25 @@ func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
 	select {
 	case replyMsg := <-replyCh:
 		reply.Err = replyMsg.Err
-		reply.WrongLeader = replyMsg.WrongLeader
 	case <-time.After(500 * time.Millisecond):
 		reply.Err = ErrTimeOut
 	}
 
+	sc.mu.Lock()
 	go sc.freeReplyMap(toCommitIdx)
 }
 
 func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 	// Your code here.
 	sc.mu.Lock()
+	defer sc.mu.Unlock()
+
+	_, isLeader := sc.rf.GetState()
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
 	if lastOpIdx, ok := sc.lastOpMap[args.ClientId]; ok {
 		if lastOpIdx >= args.CommandId {
 			reply.Err = ErrDup
@@ -239,18 +254,11 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 			} else {
 				reply.Config = sc.configs[args.Num]
 			}
-			sc.mu.Unlock()
 			return
 		}
 	}
 
-	Args, err := json.Marshal(args)
-	if err != nil {
-		reply.Err = ErrJson
-		DPrintf("Json failed. server id: %d, client id: %d, command id: %d", sc.me, args.ClientId, args.CommandId)
-		sc.mu.Unlock()
-		return
-	}
+	Args, _ := json.Marshal(args)
 	op := Op{
 		Op:        "Query",
 		Args:      Args,
@@ -258,14 +266,14 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 		CommandId: args.CommandId,
 	}
 
+	// DPrintf("%d on query", sc.me)
 	toCommitIdx, _, isLeader := sc.rf.Start(op)
+	DPrintf("%d query to commitIdx %d, isLeader %t\n", sc.me, toCommitIdx, isLeader)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
-		reply.WrongLeader = true
-		sc.mu.Unlock()
 		return
 	}
-	DPrintf("%d query to commitIdx %d, config number %d\n", sc.me, toCommitIdx, args.Num)
+	// DPrintf("%d query to commitIdx %d, config number %d\n", sc.me, toCommitIdx, args.Num)
 
 	replyCh := make(chan ReplyMsg)
 	sc.replyChMap[toCommitIdx] = replyCh
@@ -275,13 +283,15 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 	select {
 	case replyMsg := <-replyCh:
 		reply.Err = replyMsg.Err
-		reply.WrongLeader = replyMsg.WrongLeader
-		reply.Config = replyMsg.Config
-		// DPrintf("%d query config size %d", sc.me, len(sc.configs))
+		reply.Config = Config{}
+		// DPrintf("%d copy config number %d to %d", sc.me, replyMsg.Config.Num, reply.Config.Num)
+		copyConfig(&reply.Config, &replyMsg.Config)
 	case <-time.After(500 * time.Millisecond):
 		reply.Err = ErrTimeOut
+		// DPrintf("%d query, num %d, clientId %d, commandId %d, commitIdx %d TIMEOUT", sc.me, args.Num, args.ClientId, args.CommandId, toCommitIdx)
 	}
 
+	sc.mu.Lock()
 	go sc.freeReplyMap(toCommitIdx)
 }
 
@@ -290,12 +300,6 @@ func (sc *ShardCtrler) handleJoin(args *JoinArgs, reply *ReplyMsg) {
 
 	new_config := new(Config)
 	new_config.Groups = make(map[int][]string)
-
-	defer func() {
-		reply.Err = OK
-		reply.WrongLeader = false
-
-	}()
 
 	new_GIds := make([]int, 0)
 	// 拷贝原配置中的服务器信息
@@ -402,10 +406,6 @@ func (sc *ShardCtrler) handleJoin(args *JoinArgs, reply *ReplyMsg) {
 }
 
 func (sc *ShardCtrler) handleLeave(args *LeaveArgs, reply *ReplyMsg) {
-	defer func() {
-		reply.Err = OK
-		reply.WrongLeader = false
-	}()
 
 	leave_gids := args.GIDs
 	// buffer用来存储leave groups中包含的shards，分配给剩余groups
@@ -503,27 +503,16 @@ func (sc *ShardCtrler) handleLeave(args *LeaveArgs, reply *ReplyMsg) {
 }
 
 func (sc *ShardCtrler) handleQuery(args *QueryArgs, reply *ReplyMsg) {
-	defer func() {
-		reply.Err = OK
-		reply.WrongLeader = false
-	}()
-
 	n := args.Num
 	if n == -1 || n >= len(sc.configs) {
-		// 返回最新config
+		// 拷贝返回最新config
 		reply.Config = sc.configs[len(sc.configs)-1]
 	} else {
 		reply.Config = sc.configs[n]
 	}
-	DPrintf("%d query number: %d, shard: %v", sc.me, args.Num, reply.Config.Shards)
 }
 
 func (sc *ShardCtrler) handleMove(args *MoveArgs, reply *ReplyMsg) {
-	defer func() {
-		reply.Err = OK
-		reply.WrongLeader = false
-	}()
-
 	// 待move shard的当前gid
 	cgid := sc.configs[len(sc.configs)-1].Shards[args.Shard]
 	// 移除cgid中的对应shard
@@ -557,15 +546,13 @@ func (sc *ShardCtrler) handleMove(args *MoveArgs, reply *ReplyMsg) {
 func (sc *ShardCtrler) execMsg() {
 	// 逐个应用raft已commit的op
 	for !sc.killed() {
-		select {
-		case msg := <-sc.applyCh:
-			// 从applyCh中获取已提交的msg
-			if msg.CommandValid {
-				sc.applyOp(msg)
-			} else {
-				DPrintf("%d error applied msg", sc.me)
-				sc.Kill()
-			}
+		msg := <-sc.applyCh
+		// 从applyCh中获取已提交的msg
+		if msg.CommandValid {
+			sc.applyOp(msg)
+		} else {
+			DPrintf("%d error applied msg", sc.me)
+			sc.Kill()
 		}
 	}
 }
@@ -574,10 +561,16 @@ func (sc *ShardCtrler) applyOp(msg raft.ApplyMsg) {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 
+	// 判断term是否过期
+	term, isLeader := sc.rf.GetState()
+
 	op := msg.Command.(Op)
 	commitIdx := msg.CommandIndex
 	replyTerm := msg.CommandTerm
-	DPrintf("%d op %s, clientId %d, commandId %d, commitIdx %d, term %d", sc.me, op.Op, op.ClientId, op.CommandId, commitIdx, replyTerm)
+
+	if isLeader {
+		DPrintf("%d op %s, clientId %d, commandId %d, commitIdx %d, term %d", sc.me, op.Op, op.ClientId, op.CommandId, commitIdx, replyTerm)
+	}
 
 	if lastOpIdx, ok := sc.lastOpMap[op.ClientId]; ok {
 		if lastOpIdx >= op.CommandId {
@@ -588,59 +581,33 @@ func (sc *ShardCtrler) applyOp(msg raft.ApplyMsg) {
 	}
 
 	var replyMsg ReplyMsg
+	replyMsg.Err = OK
 	if op.Op == "Join" {
 		var args JoinArgs
-		err := json.Unmarshal([]byte(op.Args), &args)
-		if err != nil {
-			// 放任超时
-			DPrintf("%d unjson failed in applyOp.", sc.me)
-			return
-		}
-
-		// handle join
+		json.Unmarshal([]byte(op.Args), &args)
 		sc.handleJoin(&args, &replyMsg)
 	} else if op.Op == "Leave" {
 		var args LeaveArgs
-		err := json.Unmarshal([]byte(op.Args), &args)
-		if err != nil {
-			// 放任超时
-			DPrintf("%d unjson failed in applyOp.", sc.me)
-			return
-		}
-
-		// handle leave
+		json.Unmarshal([]byte(op.Args), &args)
 		sc.handleLeave(&args, &replyMsg)
 	} else if op.Op == "Query" {
 		var args QueryArgs
-		err := json.Unmarshal([]byte(op.Args), &args)
-		if err != nil {
-			// 放任超时
-			DPrintf("%d unjson failed in applyOp.", sc.me)
-			return
-		}
-
+		json.Unmarshal([]byte(op.Args), &args)
 		sc.handleQuery(&args, &replyMsg)
 	} else if op.Op == "Move" {
 		var args MoveArgs
-		err := json.Unmarshal([]byte(op.Args), &args)
-		if err != nil {
-			// 放任超时
-			DPrintf("%d unjson failed in applyOp.", sc.me)
-			return
-		}
-
+		json.Unmarshal([]byte(op.Args), &args)
 		sc.handleMove(&args, &replyMsg)
 	}
 
 	// 更新对应client的最新op id
 	sc.lastOpMap[op.ClientId] = op.CommandId
 
-	// 判断term是否过期
-	term, isLeader := sc.rf.GetState()
 	// 如果exec时的当前term跟op提交时一致，并且sc依然是leader，则成功响应，否则放任超时
 	if replyCh, ok := sc.replyChMap[commitIdx]; ok && isLeader && term == replyTerm {
 		replyCh <- replyMsg
 	}
+
 }
 
 //
@@ -692,6 +659,6 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	sc.GIds = append(sc.GIds, 0)
 
 	go sc.execMsg()
-
+	DPrintf("%d launched...", sc.me)
 	return sc
 }
