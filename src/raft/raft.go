@@ -536,6 +536,7 @@ func (rf *Raft) replicateLog(cmd interface{}) int {
 	toCommitIdx := rf.logIdxToAbsIdx(len(rf.log) - 1)
 
 	// 立马开始一轮广播
+	DPrintf("%d start replicate log to commitIdx %d broad casting...", rf.me, toCommitIdx)
 	go rf.broadCast()
 	return toCommitIdx
 }
@@ -757,6 +758,7 @@ func (rf *Raft) GetVoteWrap(server int, ch chan<- bool) {
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
+	DPrintf("%d Start op...", rf.me)
 	index := -1
 	term := -1
 	isLeader := true
@@ -857,7 +859,7 @@ func (rf *Raft) startElection() {
 // The ticker go routine starts a new election if this peer hasn't received
 // heartsbeats recently.
 func (rf *Raft) ticker() {
-	for rf.killed() == false {
+	for !rf.killed() {
 
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using

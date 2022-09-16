@@ -73,18 +73,18 @@ func (sc *ShardCtrler) freeReplyMap(index int) {
 	delete(sc.replyChMap, index)
 }
 
-func copyConfig(trg *Config, src *Config) {
-	trg.Num = src.Num
-	trg.Shards = src.Shards
-	trg.Groups = make(map[int][]string)
-	for k, v := range src.Groups {
-		if _, ok := trg.Groups[k]; !ok {
-			trg.Groups[k] = make([]string, 0)
-		}
+// func copyConfig(trg *Config, src *Config) {
+// 	trg.Num = src.Num
+// 	trg.Shards = src.Shards
+// 	trg.Groups = make(map[int][]string)
+// 	for k, v := range src.Groups {
+// 		if _, ok := trg.Groups[k]; !ok {
+// 			trg.Groups[k] = make([]string, 0)
+// 		}
 
-		trg.Groups[k] = append(trg.Groups[k], v...)
-	}
-}
+// 		trg.Groups[k] = append(trg.Groups[k], v...)
+// 	}
+// }
 
 func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 	// Your code here.
@@ -119,8 +119,8 @@ func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 		return
 	}
 
-	replyCh := make(chan ReplyMsg)
-	sc.replyChMap[toCommitIdx] = replyCh
+	sc.replyChMap[toCommitIdx] = make(chan ReplyMsg)
+	replyCh := sc.replyChMap[toCommitIdx]
 	sc.mu.Unlock()
 
 	// 等待完成或超时
@@ -168,8 +168,8 @@ func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
 		return
 	}
 
-	replyCh := make(chan ReplyMsg)
-	sc.replyChMap[toCommitIdx] = replyCh
+	sc.replyChMap[toCommitIdx] = make(chan ReplyMsg)
+	replyCh := sc.replyChMap[toCommitIdx]
 	sc.mu.Unlock()
 
 	// 等待完成或超时
@@ -218,8 +218,8 @@ func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
 		return
 	}
 
-	replyCh := make(chan ReplyMsg)
-	sc.replyChMap[toCommitIdx] = replyCh
+	sc.replyChMap[toCommitIdx] = make(chan ReplyMsg)
+	replyCh := sc.replyChMap[toCommitIdx]
 	sc.mu.Unlock()
 
 	// 等待完成或超时
@@ -266,29 +266,24 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 		CommandId: args.CommandId,
 	}
 
-	// DPrintf("%d on query", sc.me)
 	toCommitIdx, _, isLeader := sc.rf.Start(op)
-	DPrintf("%d query to commitIdx %d, isLeader %t\n", sc.me, toCommitIdx, isLeader)
+	// DPrintf("%d query to commitIdx %d, isLeader %t\n", sc.me, toCommitIdx, isLeader)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 		return
 	}
-	// DPrintf("%d query to commitIdx %d, config number %d\n", sc.me, toCommitIdx, args.Num)
 
-	replyCh := make(chan ReplyMsg)
-	sc.replyChMap[toCommitIdx] = replyCh
+	sc.replyChMap[toCommitIdx] = make(chan ReplyMsg)
+	replyCh := sc.replyChMap[toCommitIdx]
 	sc.mu.Unlock()
 
 	// 等待完成或超时
 	select {
 	case replyMsg := <-replyCh:
 		reply.Err = replyMsg.Err
-		reply.Config = Config{}
-		// DPrintf("%d copy config number %d to %d", sc.me, replyMsg.Config.Num, reply.Config.Num)
-		copyConfig(&reply.Config, &replyMsg.Config)
+		reply.Config = replyMsg.Config
 	case <-time.After(500 * time.Millisecond):
 		reply.Err = ErrTimeOut
-		// DPrintf("%d query, num %d, clientId %d, commandId %d, commitIdx %d TIMEOUT", sc.me, args.Num, args.ClientId, args.CommandId, toCommitIdx)
 	}
 
 	sc.mu.Lock()
@@ -297,7 +292,6 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 
 // 实际处理Join的回调函数
 func (sc *ShardCtrler) handleJoin(args *JoinArgs, reply *ReplyMsg) {
-
 	new_config := new(Config)
 	new_config.Groups = make(map[int][]string)
 
@@ -558,6 +552,7 @@ func (sc *ShardCtrler) execMsg() {
 }
 
 func (sc *ShardCtrler) applyOp(msg raft.ApplyMsg) {
+
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 
@@ -604,10 +599,14 @@ func (sc *ShardCtrler) applyOp(msg raft.ApplyMsg) {
 	sc.lastOpMap[op.ClientId] = op.CommandId
 
 	// 如果exec时的当前term跟op提交时一致，并且sc依然是leader，则成功响应，否则放任超时
-	if replyCh, ok := sc.replyChMap[commitIdx]; ok && isLeader && term == replyTerm {
-		replyCh <- replyMsg
+	if isLeader && term == replyTerm {
+		if replyCh, ok := sc.replyChMap[commitIdx]; ok {
+			select {
+			case replyCh <- replyMsg:
+			case <-time.After(100 * time.Millisecond):
+			}
+		}
 	}
-
 }
 
 //

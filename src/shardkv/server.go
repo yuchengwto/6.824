@@ -14,7 +14,7 @@ import (
 	"6.824/shardctrler"
 )
 
-const Debug = true
+const Debug = false
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -425,7 +425,7 @@ func (kv *ShardKV) ShardChange() {
 		return
 	}
 
-	// DPrintf("%d of gid %d querying config number  %d ...", kv.me, kv.gid, kv.config.Num+1)
+	DPrintf("%d of gid %d querying config number  %d ...", kv.me, kv.gid, kv.config.Num+1)
 	// tchannel := make(chan shardctrler.Config)
 	// var config shardctrler.Config
 	// for {
@@ -723,7 +723,10 @@ func (kv *ShardKV) applyOp(msg raft.ApplyMsg) {
 	term, isLeader := kv.rf.GetState()
 	// 如果exec时的当前term跟op提交时一致，并且kv依然是leader，则成功响应，否则放任超时
 	if replyCh, ok := kv.replyChMap[commitIdx]; ok && isLeader && term == replyTerm {
-		replyCh <- replyMsg
+		select {
+		case replyCh <- replyMsg:
+		case <-time.After(100 * time.Millisecond):
+		}
 	}
 
 	// 判断是否需要snapshot
@@ -744,20 +747,17 @@ func (kv *ShardKV) applySnapshot(msg raft.ApplyMsg) {
 func (kv *ShardKV) execMsg() {
 	// 逐个应用raft已commit的op
 	for !kv.killed() {
-		select {
-		case msg := <-kv.applyCh:
-			// 从applyCh中获取已提交的msg
-			if msg.CommandValid {
-				kv.applyOp(msg)
-			} else if msg.SnapshotValid {
-				kv.applySnapshot(msg)
-			} else {
-				DPrintf("%d of gid %d error applied msg", kv.me, kv.gid)
-				kv.Kill()
-			}
-		case <-time.After(1000 * time.Millisecond):
-			// 1000ms内没有消息，修改kv状态
+		msg := <-kv.applyCh
+		// 从applyCh中获取已提交的msg
+		if msg.CommandValid {
+			kv.applyOp(msg)
+		} else if msg.SnapshotValid {
+			kv.applySnapshot(msg)
+		} else {
+			DPrintf("%d of gid %d error applied msg", kv.me, kv.gid)
+			kv.Kill()
 		}
+
 	}
 }
 
